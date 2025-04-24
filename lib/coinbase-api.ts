@@ -1,366 +1,329 @@
-// Fix TypeScript errors by adding proper type annotations
-import crypto from 'crypto';
-import axios from 'axios';
-import { v4 as uuidv4 } from 'uuid';
+import { makeJwtAuthenticatedRequest } from "./coinbase-jwt"
+import { monitoring } from "@/lib/monitoring-service"
 
-// Error types
-export enum CoinbaseErrorType {
-  AUTHENTICATION = 'InvalidCredentials',
-  RATE_LIMIT = 'RateLimit',
-  INSUFFICIENT_FUNDS = 'InsufficientFunds',
-  INVALID_REQUEST = 'InvalidRequest',
-  UNKNOWN = 'Unknown',
-}
-
-// Custom error class for Coinbase API errors
+// Define a custom error class for Coinbase API errors
 export class CoinbaseAPIError extends Error {
-  type: CoinbaseErrorType;
-  statusCode?: number;
-  
-  constructor(message: string, type: CoinbaseErrorType = CoinbaseErrorType.UNKNOWN, statusCode?: number) {
-    super(message);
-    this.name = 'CoinbaseAPIError';
-    this.type = type;
-    this.statusCode = statusCode;
+  type: string
+  constructor(message: string, type: string) {
+    super(message)
+    this.name = "CoinbaseAPIError"
+    this.type = type
   }
 }
 
-// Response types
-interface CoinbaseOrderResponse {
-  order_id: string;
-  status: string;
-  [key: string]: any;
-}
+// Retry configuration
+const MAX_RETRIES = 3
+const RETRY_DELAY_MS = 1000
 
-interface CoinbaseProductsResponse {
-  products?: any[];
-  [key: string]: any;
-}
-
-// Monitoring service for logging
-export const monitoring = {
-  info: (message: string, data?: any) => {
-    console.log(`[INFO] ${message}`, data || '');
-  },
-  warn: (message: string, data?: any) => {
-    console.warn(`[WARN] ${message}`, data || '');
-  },
-  error: (message: string, data?: any) => {
-    console.error(`[ERROR] ${message}`, data || '');
-  },
-  recordTradeEvent: (data: any) => {
-    console.log(`[TRADE] Recording trade event:`, data);
-  }
-};
-
-// Retry logic for API requests
-export async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3, delay = 1000): Promise<T> {
-  let lastError: any;
-  
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      
-      // Don't retry certain errors
-      if (error instanceof CoinbaseAPIError) {
-        if (error.type === CoinbaseErrorType.AUTHENTICATION || 
-            error.type === CoinbaseErrorType.INSUFFICIENT_FUNDS) {
-          throw error;
-        }
-      }
-      
-      // If this is the last attempt, throw the error
-      if (attempt === maxRetries) {
-        throw lastError;
-      }
-      
-      // Wait before retrying
-      const retryDelay = delay * Math.pow(2, attempt - 1);
-      monitoring.warn(`Retrying after error (attempt ${attempt}/${maxRetries}). Waiting ${retryDelay}ms`, {
-        error: lastError instanceof Error ? lastError.message : 'Unknown error',
-      });
-      
-      await new Promise(resolve => setTimeout(resolve, retryDelay));
-    }
-  }
-  
-  throw lastError;
-}
-
-// Make JWT authenticated request to Coinbase API
-export async function makeJwtAuthenticatedRequest<T>(
-  method: string,
-  path: string,
-  body?: any,
-  queryParams?: Record<string, string>
-): Promise<T> {
-  const apiKey = process.env.COINBASE_API_KEY;
-  const apiSecret = process.env.COINBASE_API_SECRET;
-  
-  if (!apiKey || !apiSecret) {
-    throw new CoinbaseAPIError(
-      'Missing Coinbase API credentials',
-      CoinbaseErrorType.AUTHENTICATION
-    );
-  }
-  
+// Helper function to add retry logic to API calls
+async function withRetry<T>(fn: () => Promise<T>, retries = MAX_RETRIES, delay = RETRY_DELAY_MS): Promise<T> {
   try {
-    // Prepare the request
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const url = new URL(`https://api.coinbase.com${path}`);
-    
-    // Add query parameters if provided
-    if (queryParams) {
-      Object.entries(queryParams).forEach(([key, value]) => {
-        url.searchParams.append(key, value);
-      });
-    }
-    
-    // Create the message to sign
-    const requestPath = url.pathname + url.search;
-    const bodyString = body ? JSON.stringify(body) : '';
-    const message = timestamp + method + requestPath + bodyString;
-    
-    // Sign the message
-    const hmac = crypto.createHmac('sha256', apiSecret);
-    const signature = hmac.update(message).digest('hex');
-    
-    // Make the request
-    const response = await axios({
-      method,
-      url: url.toString(),
-      headers: {
-        'CB-ACCESS-KEY': apiKey,
-        'CB-ACCESS-SIGN': signature,
-        'CB-ACCESS-TIMESTAMP': timestamp,
-        'Content-Type': 'application/json',
-      },
-      data: body,
-    });
-    
-    return response.data as T;
+    return await fn()
   } catch (error) {
-    if (axios.isAxiosError(error) && error.response) {
-      const { status, data } = error.response;
-      
-      // Determine error type based on status code and response
-      let errorType = CoinbaseErrorType.UNKNOWN;
-      
-      if (status === 401) {
-        errorType = CoinbaseErrorType.AUTHENTICATION;
-      } else if (status === 429) {
-        errorType = CoinbaseErrorType.RATE_LIMIT;
-      } else if (status === 400 && data?.message?.includes('insufficient funds')) {
-        errorType = CoinbaseErrorType.INSUFFICIENT_FUNDS;
-      } else if (status === 400) {
-        errorType = CoinbaseErrorType.INVALID_REQUEST;
-      }
-      
-      throw new CoinbaseAPIError(
-        data?.message || `Coinbase API error: ${status}`,
-        errorType,
-        status
-      );
+    // Don't retry on authentication errors
+    if (error instanceof CoinbaseAPIError && (error.type === "InvalidCredentials" || error.type.includes("auth"))) {
+      throw error
     }
-    
-    throw new CoinbaseAPIError(
-      error instanceof Error ? error.message : 'Unknown error',
-      CoinbaseErrorType.UNKNOWN
-    );
+
+    // Don't retry if we've exhausted our retries
+    if (retries <= 0) {
+      throw error
+    }
+
+    // Log retry attempt
+    monitoring.warn("Coinbase API call failed, retrying...", {
+      error: error instanceof Error ? error.message : "Unknown error",
+      retriesLeft: retries - 1,
+    })
+
+    // Wait before retrying
+    await new Promise((resolve) => setTimeout(resolve, delay))
+
+    // Exponential backoff
+    return withRetry(fn, retries - 1, delay * 2)
   }
 }
 
-// Create a market order
-export async function createMarketOrder(
-  productId: string,
-  side: string,
-  size: string,
-  isSizeInQuote = false
-): Promise<CoinbaseOrderResponse> {
-  try {
-    const clientOrderId = `super777-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    
-    // Configure order based on size type
-    let orderConfiguration: any = {};
-    if (isSizeInQuote) {
-      orderConfiguration = {
-        market_market_ioc: {
-          quote_size: size,
-        },
-      };
-    } else {
-      orderConfiguration = {
-        market_market_ioc: {
-          base_size: size,
-        },
-      };
+// Types to replace the SDK types
+export type Account = {
+  id: string
+  name: string
+  currency: string
+  available_balance: { value: string; currency: string }
+  hold: { value: string; currency: string }
+}
+
+export type Product = {
+  product_id: string
+  price: string
+  price_percentage_change_24h: string
+  volume_24h: string
+  status: string
+  quote_currency_id: string
+  base_currency_id: string
+}
+
+export type Order = {
+  order_id: string
+  product_id: string
+  side: string
+  status: string
+  time_in_force: string
+  created_time: string
+  completion_time?: string
+  filled_size?: string
+  filled_value?: string
+  average_filled_price?: string
+}
+
+// Get account details with retry logic
+export async function getAccounts() {
+  return withRetry(async () => {
+    try {
+      return await makeJwtAuthenticatedRequest("GET", "/api/v3/brokerage/accounts")
+    } catch (error) {
+      console.error("Error fetching accounts:", error)
+      throw error
     }
-    
-    // Prepare payload
+  })
+}
+
+// Get product information with retry logic
+export async function getProducts() {
+  return withRetry(async () => {
+    try {
+      return await makeJwtAuthenticatedRequest("GET", "/api/v3/brokerage/products")
+    } catch (error) {
+      console.error("Error fetching products:", error)
+      throw error
+    }
+  })
+}
+
+// Get specific product with retry logic
+export async function getProduct(productId: string) {
+  return withRetry(async () => {
+    try {
+      return await makeJwtAuthenticatedRequest("GET", `/api/v3/brokerage/products/${productId}`)
+    } catch (error) {
+      console.error(`Error fetching product ${productId}:`, error)
+      throw error
+    }
+  })
+}
+
+// Get product ticker with retry logic
+export async function getProductTicker(productId: string) {
+  return withRetry(async () => {
+    try {
+      return await makeJwtAuthenticatedRequest("GET", `/api/v3/brokerage/products/${productId}/ticker`)
+    } catch (error) {
+      console.error(`Error fetching ticker for ${productId}:`, error)
+      throw error
+    }
+  })
+}
+
+// Get open orders with retry logic
+export async function getOpenOrders() {
+  return withRetry(async () => {
+    try {
+      return await makeJwtAuthenticatedRequest("GET", "/api/v3/brokerage/orders/historical?status=OPEN")
+    } catch (error) {
+      console.error("Error fetching open orders:", error)
+      throw error
+    }
+  })
+}
+
+// Place a market order with retry logic (but only retry safe operations)
+export async function placeMarketOrder(productId: string, side: "BUY" | "SELL", size: string, isSizeInQuote = false) {
+  // Don't retry order placement to avoid duplicate orders
+  try {
+    // Generate a unique client order ID
+    const clientOrderId = `super777-${Date.now()}-${Math.floor(Math.random() * 1000)}`
+
+    // Create order configuration based on whether size is in base or quote currency
+    const orderConfiguration = isSizeInQuote
+      ? { market_market_ioc: { quote_size: size } }
+      : { market_market_ioc: { base_size: size } }
+
     const payload = {
       client_order_id: clientOrderId,
       product_id: productId,
       side: side,
       order_configuration: orderConfiguration,
-    };
-    
-    monitoring.info(`Placing ${side} order for ${productId}`, { size, isSizeInQuote });
-    const response = await makeJwtAuthenticatedRequest<CoinbaseOrderResponse>("POST", "/api/v3/brokerage/orders", payload);
-    
+    }
+
+    monitoring.info(`Placing ${side} order for ${productId}`, { size, isSizeInQuote })
+    const response = await makeJwtAuthenticatedRequest("POST", "/api/v3/brokerage/orders", payload)
+
     // Log successful order
     monitoring.info(`Successfully placed ${side} order for ${productId}`, {
       orderId: response.order_id,
       status: response.status,
-    });
-    
-    return response;
+    })
+
+    return response
   } catch (error) {
-    console.error(`Error placing ${side} order for ${productId}:`, error);
+    console.error(`Error placing ${side} order for ${productId}:`, error)
     monitoring.error(`Failed to place ${side} order for ${productId}`, {
       error: error instanceof Error ? error.message : "Unknown error",
       size,
       isSizeInQuote,
-    });
-    throw error;
+    })
+    throw error
   }
 }
 
-// Create a limit order
-export async function createLimitOrder(
-  productId: string,
-  side: string,
-  size: string,
-  limitPrice: string,
-  timeInForce = 'GTC',
-  postOnly = false
-): Promise<CoinbaseOrderResponse> {
-  try {
-    const clientOrderId = `super777-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    
-    // Configure order
-    const orderConfiguration = {
-      limit_limit_gtc: {
-        base_size: size,
-        limit_price: limitPrice,
-        post_only: postOnly,
-      },
-    };
-    
-    // Prepare payload
-    const payload = {
-      client_order_id: clientOrderId,
-      product_id: productId,
-      side: side,
-      order_configuration: orderConfiguration,
-    };
-    
-    monitoring.info(`Placing ${side} limit order for ${productId}`, { 
-      size, 
-      limitPrice,
-      timeInForce,
-      postOnly 
-    });
-    
-    const response = await makeJwtAuthenticatedRequest<CoinbaseOrderResponse>("POST", "/api/v3/brokerage/orders", payload);
-    
-    // Log successful order
-    monitoring.info(`Successfully placed ${side} limit order for ${productId}`, {
-      orderId: response.order_id,
-      status: response.status,
-    });
-    
-    return response;
-  } catch (error) {
-    console.error(`Error placing ${side} limit order for ${productId}:`, error);
-    monitoring.error(`Failed to place ${side} limit order for ${productId}`, {
-      error: error instanceof Error ? error.message : "Unknown error",
-      size,
-      limitPrice,
-    });
-    throw error;
-  }
-}
-
-// Get historical candles
+// Get historical candles with retry logic
 export async function getCandles(productId: string, granularity: string, start?: string, end?: string) {
   return withRetry(async () => {
     try {
-      let path = `/api/v3/brokerage/products/${productId}/candles?granularity=${granularity}`;
-      if (start) path += `&start=${start}`;
-      if (end) path += `&end=${end}`;
-      
-      return await makeJwtAuthenticatedRequest("GET", path);
+      let path = `/api/v3/brokerage/products/${productId}/candles?granularity=${granularity}`
+
+      if (start) path += `&start=${start}`
+      if (end) path += `&end=${end}`
+
+      return await makeJwtAuthenticatedRequest("GET", path)
     } catch (error) {
-      console.error(`Error fetching candles for ${productId}:`, error);
-      throw error;
+      console.error(`Error fetching candles for ${productId}:`, error)
+      throw error
     }
-  });
+  })
 }
 
-// Test API connection
+// Test API connection with retry logic
 export async function testConnection() {
   return withRetry(async () => {
     try {
-      const response = await makeJwtAuthenticatedRequest<CoinbaseProductsResponse>("GET", "/api/v3/brokerage/products");
+      const response = await makeJwtAuthenticatedRequest("GET", "/api/v3/brokerage/products")
       return {
         success: true,
         message: "Successfully connected to Coinbase API",
         productsCount: response.products?.length || 0,
-      };
+      }
     } catch (error) {
-      console.error("Error testing Coinbase connection:", error);
+      console.error("Error testing Coinbase connection:", error)
       return {
         success: false,
         message: error instanceof Error ? error.message : "Unknown error connecting to Coinbase API",
-      };
+      }
     }
-  });
+  })
 }
 
-// Get account balances
-export async function getAccountBalances() {
+// Function to execute an order with improved error handling
+export async function executeOrder(orderParams: {
+  side: string
+  product_id: string
+  size: string
+  type?: string
+  price?: string
+  time_in_force?: string
+}) {
   try {
-    const response = await makeJwtAuthenticatedRequest<any>("GET", "/api/v3/brokerage/accounts");
-    return response.accounts || [];
+    const { side, product_id, size, type = "market", price, time_in_force = "IOC" } = orderParams
+
+    // Validate required parameters
+    if (!side || !product_id || !size) {
+      throw new Error("Missing required parameters: side, product_id, and size")
+    }
+
+    // Log the order attempt
+    monitoring.info(`Executing ${side} order for ${product_id}`, {
+      size,
+      type,
+      price: price || "market",
+    })
+
+    // Construct the order payload
+    const payload: any = {
+      client_order_id: `super777-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      product_id: product_id,
+      side: side.toUpperCase(),
+    }
+
+    if (type === "market") {
+      payload.order_configuration = {
+        market_market_ioc: {
+          base_size: size,
+        },
+      }
+    } else if (type === "limit" && price) {
+      payload.order_configuration = {
+        limit_limit_gtc: {
+          base_size: size,
+          limit_price: price,
+          post_only: false,
+        },
+      }
+    } else {
+      throw new Error("Invalid order type or missing price for limit order")
+    }
+
+    const response = await makeJwtAuthenticatedRequest("POST", "/api/v3/brokerage/orders", payload)
+
+    // Log the successful order
+    monitoring.info(`Order executed successfully`, {
+      orderId: response.order_id,
+      status: response.status,
+    })
+
+    // Return the order details
+    return {
+      orderId: response.order_id,
+      status: response.status,
+      productId: product_id,
+      side: side,
+      size: size,
+      type: type,
+      price: price,
+      time_in_force: time_in_force,
+    }
   } catch (error) {
-    console.error("Error getting account balances:", error);
-    throw error;
+    console.error("Error executing order:", error)
+    monitoring.error("Failed to execute order", {
+      error: error instanceof Error ? error.message : "Unknown error",
+      orderParams,
+    })
+    throw error
   }
 }
 
-// Get open orders
-export async function getOpenOrders() {
-  try {
-    const response = await makeJwtAuthenticatedRequest<any>("GET", "/api/v3/brokerage/orders/historical/pending");
-    return response.orders || [];
-  } catch (error) {
-    console.error("Error getting open orders:", error);
-    throw error;
-  }
+// Add this function to generate mock position data
+function getMockPositions() {
+  return [
+    {
+      productId: "BTC-USD",
+      size: "0.12",
+      entryPrice: "42150.75",
+      markPrice: "43250.5",
+      pnl: "131.97",
+      pnlPercentage: "2.61",
+      timestamp: new Date().toISOString(),
+    },
+    {
+      productId: "ETH-USD",
+      size: "1.5",
+      entryPrice: "2250.25",
+      markPrice: "2310.75",
+      pnl: "90.75",
+      pnlPercentage: "2.69",
+      timestamp: new Date().toISOString(),
+    },
+    {
+      productId: "XRP-USD",
+      size: "1500",
+      entryPrice: "0.62",
+      markPrice: "0.59",
+      pnl: "-45.0",
+      pnlPercentage: "-4.84",
+      timestamp: new Date().toISOString(),
+    },
+  ]
 }
 
-// Get order by ID
-export async function getOrderById(orderId: string) {
-  try {
-    const response = await makeJwtAuthenticatedRequest<any>("GET", `/api/v3/brokerage/orders/historical/${orderId}`);
-    return response;
-  } catch (error) {
-    console.error(`Error getting order ${orderId}:`, error);
-    throw error;
-  }
-}
-
-// Cancel order
-export async function cancelOrder(orderId: string) {
-  try {
-    const response = await makeJwtAuthenticatedRequest<any>("POST", "/api/v3/brokerage/orders/batch_cancel", {
-      order_ids: [orderId],
-    });
-    return response;
-  } catch (error) {
-    console.error(`Error canceling order ${orderId}:`, error);
-    throw error;
-  }
+export async function makeHmacAuthenticatedRequest<T>(method: string, path: string, body?: any): Promise<T> {
+  throw new Error("makeHmacAuthenticatedRequest is not implemented")
 }
